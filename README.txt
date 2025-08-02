@@ -14,11 +14,6 @@ INSTALLATION
 Via NPX (no installation required):
 npx wildcard-domain-finder
 
-Or clone and run locally:
-git clone https://github.com/besoeasy/wildcard-domain-finder.git
-cd wildcard-domain-finder
-node app.js
-
 USAGE
 -----
 Basic usage:
