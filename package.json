@@ -1,0 +1,22 @@
+{
+  "name": "wildcard-domain-finder",
+  "version": "0.0.1",
+  "description": "wildcard domain finder",
+  "main": "app.js",
+  "bin": {
+    "wildcard-domain-finder": "./app.js"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/besoeasy/wildcard-domain-finder.git"
+  },
+  "author": "besoeasy",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/besoeasy/wildcard-domain-finder/issues"
+  },
+  "homepage": "https://github.com/besoeasy/wildcard-domain-finder#readme"
+}
