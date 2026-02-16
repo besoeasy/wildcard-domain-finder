@@ -4,6 +4,7 @@ const fs = require("fs");
 const path = require("path");
 const dns = require("dns").promises;
 const readline = require("readline");
+const { finished } = require("stream/promises");
 
 // Configuration
 const CONFIG = {
@@ -30,14 +31,21 @@ class DomainFinder {
     this.currentlyChecking = ''; // Current domain being checked
   }
 
+  withTimeout(promise, timeoutMs) {
+    return Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        const timeoutError = new Error("DNS lookup timeout");
+        timeoutError.code = "ETIMEOUT";
+        setTimeout(() => reject(timeoutError), timeoutMs);
+      })
+    ]);
+  }
+
   // Function to check if a domain is available (unreachable/unregistered)
   async isDomainAvailable(domain) {
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), this.timeout);
-      
-      await dns.resolve(domain);
-      clearTimeout(timeoutId);
+      await this.withTimeout(dns.resolve(domain), this.timeout);
       return false; // Domain is registered/reachable
     } catch (error) {
       if (error.code === 'ENOTFOUND' || error.code === 'ENODATA') {
@@ -49,47 +57,66 @@ class DomainFinder {
     }
   }
 
-  // Generate all possible domain combinations
-  generateDomains(baseDomain, randomize = true) {
+  countDomains(baseDomain) {
+    const wildcardCount = (baseDomain.match(/\*/g) || []).length;
+    if (wildcardCount === 0) {
+      return 1;
+    }
+
+    return Math.pow(CONFIG.ALPHABET.length, wildcardCount);
+  }
+
+  *createDomainIterator(baseDomain, randomize = true) {
     if (!baseDomain.includes('*')) {
-      return [baseDomain]; // No wildcards to replace
+      yield baseDomain;
+      return;
     }
 
     const chars = CONFIG.ALPHABET.split("");
     if (randomize) {
       chars.sort(() => Math.random() - 0.5);
     }
-    
-    const domains = [];
 
-    const generateWithWildcard = (domain, index) => {
+    const generateWithWildcard = function* (domain, index) {
       if (index === domain.length) {
-        domains.push(domain);
+        yield domain;
         return;
       }
-      
+
       if (domain[index] === "*") {
         for (const char of chars) {
-          generateWithWildcard(
+          yield* generateWithWildcard(
             domain.slice(0, index) + char + domain.slice(index + 1), 
             index + 1
           );
         }
       } else {
-        generateWithWildcard(domain, index + 1);
+        yield* generateWithWildcard(domain, index + 1);
       }
     };
 
-    generateWithWildcard(baseDomain, 0);
-    return domains;
+    yield* generateWithWildcard(baseDomain, 0);
   }
 
   // Process domains in batches with concurrency control
-  async processDomainBatch(domains, writer) {
+  async processDomainBatch(baseDomain, writer) {
     const results = [];
-    
-    for (let i = 0; i < domains.length; i += this.concurrentChecks) {
-      const batch = domains.slice(i, i + this.concurrentChecks);
+    const domainIterator = this.createDomainIterator(baseDomain);
+
+    while (true) {
+      const batch = [];
+      for (let i = 0; i < this.concurrentChecks; i++) {
+        const nextValue = domainIterator.next();
+        if (nextValue.done) {
+          break;
+        }
+        batch.push(nextValue.value);
+      }
+
+      if (batch.length === 0) {
+        break;
+      }
+
       const batchPromises = batch.map(async (domain) => {
         this.currentlyChecking = domain;
         const available = await this.isDomainAvailable(domain);
@@ -113,7 +140,7 @@ class DomainFinder {
       results.push(...batchResults);
 
       // Update progress more frequently for better UX
-      if (this.stats.checked % 5 === 0 || 
+      if (this.stats.checked % CONFIG.PROGRESS_UPDATE_INTERVAL === 0 || 
           this.stats.checked === this.stats.total) {
         this.displayProgress();
       }
@@ -125,9 +152,9 @@ class DomainFinder {
   // Display progress and statistics
   displayProgress() {
     const elapsed = (Date.now() - this.stats.startTime) / 1000;
-    const rate = this.stats.checked / elapsed;
-    const eta = (this.stats.total - this.stats.checked) / rate;
-    const percentage = (this.stats.checked / this.stats.total) * 100;
+    const rate = elapsed > 0 ? this.stats.checked / elapsed : 0;
+    const eta = rate > 0 ? (this.stats.total - this.stats.checked) / rate : null;
+    const percentage = this.stats.total > 0 ? (this.stats.checked / this.stats.total) * 100 : 100;
     
     // Create progress bar
     const barWidth = 40;
@@ -176,22 +203,20 @@ class DomainFinder {
   async findAvailableDomains(baseDomain) {
     console.log(`🚀 Starting domain search for pattern: ${baseDomain}`);
     
-    // Generate all domain combinations
-    console.log('📝 Generating domain combinations...');
-    const domains = this.generateDomains(baseDomain);
-    this.stats.total = domains.length;
+    console.log('📝 Calculating domain combinations...');
+    this.stats.total = this.countDomains(baseDomain);
     this.stats.startTime = Date.now();
     
-    console.log(`📊 Generated ${domains.length} domain combinations`);
+    console.log(`📊 Generated ${this.stats.total} domain combinations`);
     console.log(`⚙️  Using ${this.concurrentChecks} concurrent checks\n`);
 
-    // Create output file
-    const filePath = path.join(__dirname, this.outputFile);
+    const filePath = path.isAbsolute(this.outputFile)
+      ? this.outputFile
+      : path.join(process.cwd(), this.outputFile);
     const writer = fs.createWriteStream(filePath, { flags: "w" }); // Overwrite mode
     
     try {
-      // Process domains
-      await this.processDomainBatch(domains, writer);
+      await this.processDomainBatch(baseDomain, writer);
       
       // Final summary
       const totalTime = (Date.now() - this.stats.startTime) / 1000;
@@ -240,6 +265,7 @@ class DomainFinder {
       
     } finally {
       writer.end();
+      await finished(writer).catch(() => {});
     }
   }
 }
@@ -264,11 +290,11 @@ function parseArguments() {
         break;
       case '-c':
       case '--concurrent':
-        options.concurrentChecks = parseInt(args[++i]) || CONFIG.CONCURRENT_CHECKS;
+        options.concurrentChecks = parseInt(args[++i], 10);
         break;
       case '-t':
       case '--timeout':
-        options.timeout = parseInt(args[++i]) || CONFIG.TIMEOUT;
+        options.timeout = parseInt(args[++i], 10);
         break;
       case '-o':
       case '--output':
@@ -348,6 +374,16 @@ async function main() {
 
   if (!domain) {
     console.error("❌ No domain pattern provided. Use --help for usage information.");
+    process.exit(1);
+  }
+
+  if (!Number.isInteger(options.concurrentChecks) || options.concurrentChecks < 1) {
+    console.error("❌ Invalid --concurrent value. It must be a positive integer.");
+    process.exit(1);
+  }
+
+  if (!Number.isInteger(options.timeout) || options.timeout < 1) {
+    console.error("❌ Invalid --timeout value. It must be a positive integer (ms).");
     process.exit(1);
   }
 
